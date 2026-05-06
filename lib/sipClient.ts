@@ -1,3 +1,9 @@
+/**
+ * sipClient.ts
+ * Koneksi ke Kamailio via Nginx reverse proxy (bukan langsung ke port 8080).
+ * Browser → Nginx (/ws) → Kamailio (UDP 5060)
+ * Protocol internal Kamailio: UDP
+ */
 
 import {
   UserAgent,
@@ -16,11 +22,14 @@ export type CallDirection = 'outgoing' | 'incoming';
 let ua: UserAgent | null = null;
 let registerer: Registerer | null = null;
 let activeSession: Session | null = null;
+let localStream: MediaStream | null = null;
 
 export interface SipCallbacks {
   onStateChange: (state: SipState) => void;
   onCallStateChange: (state: SessionState, direction: CallDirection) => void;
   onIncomingCall: (session: Invitation, callerNumber: string) => void;
+  onRemoteStream?: (stream: MediaStream) => void;
+  onLocalStream?: (stream: MediaStream) => void;
 }
 
 let callbacks: SipCallbacks | null = null;
@@ -29,27 +38,42 @@ export function setSipCallbacks(cb: SipCallbacks) {
   callbacks = cb;
 }
 
+/**
+ * Hubungkan ke Kamailio via Nginx proxy.
+ * URL: NEXT_PUBLIC_WEBSOCKET_URL = ws://IP_SERVER/ws
+ * Nginx meneruskan ke Kamailio port 8080 (WebSocket internal).
+ * Kamailio kemudian menggunakan UDP 5060 secara internal.
+ */
 export async function connectSIP(phone: string): Promise<void> {
-  const sipServer  = process.env.NEXT_PUBLIC_SIP_SERVER   ?? '10.98.56.198';
-  const wsURL      = process.env.NEXT_PUBLIC_WEBSOCKET_URL ?? `ws://${sipServer}:8080`;
-  // If Kamailio uses phone = password, set env NEXT_PUBLIC_SIP_DEFAULT_PASSWORD=phone
-  // Otherwise override with the actual domain password
-  const sipPassword = process.env.NEXT_PUBLIC_SIP_DEFAULT_PASSWORD ?? phone;
+  const sipServer = process.env.NEXT_PUBLIC_SIP_SERVER ?? '10.98.56.137';
+  // Koneksi melalui Nginx proxy — BUKAN langsung ke port Kamailio
+  const proxyUrl  = process.env.NEXT_PUBLIC_WEBSOCKET_URL ?? `ws://${sipServer}/ws`;
+  const sipPass   = process.env.NEXT_PUBLIC_SIP_DEFAULT_PASSWORD ?? phone;
 
   callbacks?.onStateChange('connecting');
 
   const options: UserAgentOptions = {
     uri: UserAgent.makeURI(`sip:${phone}@${sipServer}`),
-    transportOptions: { server: wsURL },
+    transportOptions: {
+      server:              proxyUrl,
+      traceSip:            false,
+      connectionTimeout:   10,
+    },
     authorizationUsername: phone,
-    authorizationPassword: sipPassword,
+    authorizationPassword: sipPass,
+    userAgentString: 'VoIP-Portal/1.0',
     sessionDescriptionHandlerFactoryOptions: {
-      constraints: { audio: true, video: false },
+      peerConnectionConfiguration: {
+        iceServers: [
+          { urls: 'stun:stun.l.google.com:19302' },
+          { urls: 'stun:stun1.l.google.com:19302' },
+        ],
+      },
     },
     delegate: {
       onInvite: (invitation: Invitation) => {
-        const callerURI = invitation.remoteIdentity.uri.toString();
-        const callerNumber = callerURI.replace(/sip:|@.*/g, '');
+        const raw = invitation.remoteIdentity.uri.toString();
+        const callerNumber = raw.replace(/^sip:|@.*/gi, '');
         callbacks?.onIncomingCall(invitation, callerNumber);
       },
     },
@@ -60,30 +84,28 @@ export async function connectSIP(phone: string): Promise<void> {
 
   registerer = new Registerer(ua);
   registerer.stateChange.addListener((state: RegistererState) => {
-    switch (state) {
-      case RegistererState.Registered:
-        callbacks?.onStateChange('registered');
-        break;
-      case RegistererState.Unregistered:
-        callbacks?.onStateChange('disconnected');
-        break;
-    }
+    if (state === RegistererState.Registered)   callbacks?.onStateChange('registered');
+    if (state === RegistererState.Unregistered) callbacks?.onStateChange('disconnected');
   });
 
   await registerer.register();
 }
 
-/** Voice call */
+/** Voice call — audio only */
 export async function makeCall(
   target: string,
-  remoteAudioRef: HTMLAudioElement
+  remoteAudio: HTMLAudioElement,
 ): Promise<Session> {
   if (!ua) throw new Error('SIP belum terhubung');
-  const sipServer = process.env.NEXT_PUBLIC_SIP_SERVER ?? '10.98.56.198';
-  const targetURI = UserAgent.makeURI(`sip:${target}@${sipServer}`);
-  if (!targetURI) throw new Error('Nomor tujuan tidak valid');
+  const sipServer = process.env.NEXT_PUBLIC_SIP_SERVER ?? '10.98.56.137';
+  const uri = UserAgent.makeURI(`sip:${target}@${sipServer}`);
+  if (!uri) throw new Error('Nomor tujuan tidak valid');
 
-  const inviter = new Inviter(ua, targetURI, {
+  // Minta izin mikrofon sebelum invite
+  localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+  callbacks?.onLocalStream?.(localStream);
+
+  const inviter = new Inviter(ua, uri, {
     sessionDescriptionHandlerOptions: {
       constraints: { audio: true, video: false },
     },
@@ -92,7 +114,10 @@ export async function makeCall(
   inviter.stateChange.addListener((state: SessionState) => {
     callbacks?.onCallStateChange(state, 'outgoing');
     if (state === SessionState.Established) {
-      attachAudio(inviter, remoteAudioRef);
+      attachRemoteAudio(inviter, remoteAudio);
+    }
+    if (state === SessionState.Terminated) {
+      releaseLocalStream();
     }
   });
 
@@ -101,17 +126,21 @@ export async function makeCall(
   return inviter;
 }
 
-/** Video call */
+/** Video call — audio + kamera */
 export async function makeVideoCall(
   target: string,
-  remoteAudioRef: HTMLAudioElement
+  remoteAudio: HTMLAudioElement,
 ): Promise<Session> {
   if (!ua) throw new Error('SIP belum terhubung');
-  const sipServer = process.env.NEXT_PUBLIC_SIP_SERVER ?? '10.98.56.198';
-  const targetURI = UserAgent.makeURI(`sip:${target}@${sipServer}`);
-  if (!targetURI) throw new Error('Nomor tujuan tidak valid');
+  const sipServer = process.env.NEXT_PUBLIC_SIP_SERVER ?? '10.98.56.137';
+  const uri = UserAgent.makeURI(`sip:${target}@${sipServer}`);
+  if (!uri) throw new Error('Nomor tujuan tidak valid');
 
-  const inviter = new Inviter(ua, targetURI, {
+  // Minta izin kamera + mikrofon
+  localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: true });
+  callbacks?.onLocalStream?.(localStream);
+
+  const inviter = new Inviter(ua, uri, {
     sessionDescriptionHandlerOptions: {
       constraints: { audio: true, video: true },
     },
@@ -120,7 +149,11 @@ export async function makeVideoCall(
   inviter.stateChange.addListener((state: SessionState) => {
     callbacks?.onCallStateChange(state, 'outgoing');
     if (state === SessionState.Established) {
-      attachAudio(inviter, remoteAudioRef);
+      attachRemoteAudio(inviter, remoteAudio);
+      attachRemoteVideo(inviter);
+    }
+    if (state === SessionState.Terminated) {
+      releaseLocalStream();
     }
   });
 
@@ -129,14 +162,21 @@ export async function makeVideoCall(
   return inviter;
 }
 
-/** Accept incoming call */
+/** Terima panggilan masuk */
 export async function acceptCall(
   invitation: Invitation,
-  remoteAudioRef: HTMLAudioElement
+  remoteAudio: HTMLAudioElement,
+  withVideo = false,
 ): Promise<void> {
+  localStream = await navigator.mediaDevices.getUserMedia({
+    audio: true,
+    video: withVideo,
+  });
+  callbacks?.onLocalStream?.(localStream);
+
   await invitation.accept({
     sessionDescriptionHandlerOptions: {
-      constraints: { audio: true, video: false },
+      constraints: { audio: true, video: withVideo },
     },
   });
   activeSession = invitation;
@@ -144,7 +184,11 @@ export async function acceptCall(
   invitation.stateChange.addListener((state: SessionState) => {
     callbacks?.onCallStateChange(state, 'incoming');
     if (state === SessionState.Established) {
-      attachAudio(invitation, remoteAudioRef);
+      attachRemoteAudio(invitation, remoteAudio);
+      if (withVideo) attachRemoteVideo(invitation);
+    }
+    if (state === SessionState.Terminated) {
+      releaseLocalStream();
     }
   });
 }
@@ -155,58 +199,80 @@ export async function rejectCall(invitation: Invitation): Promise<void> {
 
 export async function hangUp(): Promise<void> {
   if (!activeSession) return;
-  if (activeSession.state === SessionState.Established) {
-    await (activeSession as Inviter).bye();
-  } else {
-    await (activeSession as Inviter).cancel?.();
-  }
+  try {
+    if (activeSession.state === SessionState.Established) {
+      await (activeSession as Inviter).bye?.();
+    } else {
+      await (activeSession as Inviter).cancel?.();
+    }
+  } catch { /* ignore */ }
   activeSession = null;
+  releaseLocalStream();
 }
 
 export function setMute(muted: boolean): void {
-  const pc = getPeerConnection();
-  if (!pc) return;
-  pc.getSenders().forEach(sender => {
-    if (sender.track?.kind === 'audio') sender.track.enabled = !muted;
+  // Toggle dari localStream langsung (lebih reliable)
+  if (localStream) {
+    localStream.getAudioTracks().forEach(t => { t.enabled = !muted; });
+    return;
+  }
+  // Fallback via PeerConnection
+  getPeerConnection()?.getSenders().forEach(s => {
+    if (s.track?.kind === 'audio') s.track.enabled = !muted;
   });
 }
 
-export function sendDTMF(tone: string): void {
-  activeSession?.sessionDescriptionHandler
-    // @ts-ignore
-    ?.sendDtmf(tone);
+export function setCameraEnabled(enabled: boolean): void {
+  if (localStream) {
+    localStream.getVideoTracks().forEach(t => { t.enabled = enabled; });
+    return;
+  }
+  getPeerConnection()?.getSenders().forEach(s => {
+    if (s.track?.kind === 'video') s.track.enabled = enabled;
+  });
 }
 
-/** Helper — get local video tracks for camera toggle */
+export function getLocalStream(): MediaStream | null {
+  return localStream;
+}
+
 export function getLocalVideoTracks(): MediaStreamTrack[] {
-  const pc = getPeerConnection();
-  if (!pc) return [];
-  return pc.getSenders()
-    .filter(s => s.track?.kind === 'video')
-    .map(s => s.track as MediaStreamTrack);
+  return localStream?.getVideoTracks() ?? [];
 }
 
 export async function disconnectSIP(): Promise<void> {
   await hangUp();
-  await registerer?.unregister();
-  await ua?.stop();
+  await registerer?.unregister().catch(() => {});
+  await ua?.stop().catch(() => {});
   ua = null;
   registerer = null;
   activeSession = null;
   callbacks?.onStateChange('disconnected');
 }
 
-// ── Internal helpers ──────────────────────────────────────────────
+// ── Helpers ───────────────────────────────────────────────────────
 
 function getPeerConnection(): RTCPeerConnection | null {
   return (activeSession?.sessionDescriptionHandler as any)?.peerConnection ?? null;
 }
 
-function attachAudio(session: Session, audioEl: HTMLAudioElement) {
+function attachRemoteAudio(session: Session, audioEl: HTMLAudioElement) {
   const sdh = session.sessionDescriptionHandler as any;
-  const remoteStream = sdh?.remoteMediaStream;
-  if (remoteStream && audioEl) {
-    audioEl.srcObject = remoteStream;
+  const stream: MediaStream | undefined = sdh?.remoteMediaStream ?? sdh?.remoteMedia;
+  if (stream) {
+    audioEl.srcObject = stream;
     audioEl.play().catch(console.error);
+    callbacks?.onRemoteStream?.(stream);
   }
+}
+
+function attachRemoteVideo(session: Session) {
+  const sdh = session.sessionDescriptionHandler as any;
+  const stream: MediaStream | undefined = sdh?.remoteMediaStream ?? sdh?.remoteMedia;
+  if (stream) callbacks?.onRemoteStream?.(stream);
+}
+
+function releaseLocalStream() {
+  localStream?.getTracks().forEach(t => t.stop());
+  localStream = null;
 }

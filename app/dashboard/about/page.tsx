@@ -49,7 +49,7 @@ export default function AboutPage() {
       {/* Tech info */}
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
         {[
-          { Icon: Server, title: 'Server Kamailio', desc: 'IP: 10.98.56.198 — SIP server untuk otentikasi & routing panggilan' },
+          { Icon: Server, title: 'Server Kamailio', desc: 'IP: 10.98.56.137 — SIP server untuk otentikasi & routing panggilan' },
           { Icon: Wifi,   title: 'Protokol SIP/UDP', desc: 'Komunikasi via SIP over UDP. Browser menggunakan WebSocket sebagai transport' },
           { Icon: Shield, title: 'Autentikasi', desc: 'Login menggunakan nomor & password SIP yang terdaftar di Kamailio' },
           { Icon: Globe,  title: 'SIP.js + WebRTC', desc: 'Library SIP.js menjembatani WebSocket ↔ SIP, audio via WebRTC bawaan browser' },

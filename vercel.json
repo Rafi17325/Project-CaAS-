@@ -3,10 +3,5 @@
   "buildCommand": "npm run build",
   "outputDirectory": ".next",
   "installCommand": "npm install",
-  "env": {
-    "NEXT_PUBLIC_SUPABASE_URL": "@supabase_url",
-    "NEXT_PUBLIC_SUPABASE_ANON_KEY": "@supabase_anon_key",
-    "NEXT_PUBLIC_SIP_SERVER": "@sip_server",
-    "NEXT_PUBLIC_WEBSOCKET_URL": "@websocket_url"
-  }
+  "regions": ["sin1"]
 }
