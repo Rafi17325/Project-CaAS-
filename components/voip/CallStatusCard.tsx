@@ -16,12 +16,13 @@ function formatDuration(seconds: number): string {
   return `${m}:${s}`;
 }
 
-const statusColors: Record<CallState, string> = {
+const statusColors: Record<string, string> = {
   'Idle': 'text-gray-400',
   'Calling': 'text-yellow-300',
   'Ringing': 'text-blue-300',
   'In Call': 'text-green-400',
   'Call Ended': 'text-red-400',
+  'Incoming': 'text-purple-400',
 };
 
 export default function CallStatusCard({ status, number, duration, onEnd }: Props) {

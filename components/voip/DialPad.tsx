@@ -148,6 +148,7 @@ function VideoScreen({ onEnd }: { onEnd: () => void }) {
 }
 
 /* ── Main DialPad ────────────────────────────────────────────────── */
+export type CallState = 'Idle' | 'Calling' | 'Ringing' | 'In Call' | 'Call Ended' | 'Incoming';
 export default function DialPad() {
   const [number, setNumber] = useState('');
   const {
